@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/davecgh/go-spew/spew"
 	"github.com/jmoiron/sqlx/reflectx"
 )
 
@@ -889,8 +890,10 @@ func structOnlyError(t reflect.Type) error {
 // this is the only way to not duplicate reflect work in the new API while
 // maintaining backwards compatibility.
 func scanAll(rows rowsi, dest interface{}, structOnly bool) error {
+	// 变量定义得过早，遍历rows时候用。这里的v指的是slice中的elem。
 	var v, vp reflect.Value
 
+	// dest的 reflection object，可以使用value.Interface()逆向回去
 	value := reflect.ValueOf(dest)
 
 	// json.Unmarshal returns errors for these
@@ -900,21 +903,27 @@ func scanAll(rows rowsi, dest interface{}, structOnly bool) error {
 	if value.IsNil() {
 		return errors.New("nil pointer passed to StructScan destination")
 	}
+	// 如果value是指针，取出指针指向的元素
 	direct := reflect.Indirect(value)
 
+	// slice reflect.Type
 	slice, err := baseType(value.Type(), reflect.Slice)
 	if err != nil {
 		return err
 	}
 
+	// isPtr用于 元素是以ptr还是elem的形式插入到slice
 	isPtr := slice.Elem().Kind() == reflect.Ptr
+	// slice元素的类型
 	base := reflectx.Deref(slice.Elem())
+	// struct类型不是scannable的
 	scannable := isScannable(base)
 
 	if structOnly && scannable {
 		return structOnlyError(base)
 	}
 
+	// rows.columns sql中就有
 	columns, err := rows.Columns()
 	if err != nil {
 		return err
@@ -926,6 +935,7 @@ func scanAll(rows rowsi, dest interface{}, structOnly bool) error {
 	}
 
 	if !scannable {
+		// DB数据读入values slice中，定义过早吧
 		var values []interface{}
 		var m *reflectx.Mapper
 
@@ -936,6 +946,7 @@ func scanAll(rows rowsi, dest interface{}, structOnly bool) error {
 			m = mapper()
 		}
 
+		// fields的索引
 		fields := m.TraversalsByName(base, columns)
 		// if we are not unsafe and are missing fields, return an error
 		if f, err := missingFields(fields); err != nil && !isUnsafe(rows) {
@@ -948,17 +959,24 @@ func scanAll(rows rowsi, dest interface{}, structOnly bool) error {
 			vp = reflect.New(base)
 			v = reflect.Indirect(vp)
 
+			// values与v中的字段关联起来
+			// TODO: 为啥是ptrs=true
 			err = fieldsByTraversal(v, fields, values, true)
 			if err != nil {
 				return err
 			}
 
+			// 这样scan只要与之前一样处理即可，而对应的v也有了字段
 			// scan into the struct field pointers and append to our results
 			err = rows.Scan(values...)
 			if err != nil {
 				return err
 			}
 
+			// 使用interface()方法离开反射的世界，values与struct之间联系生效了
+			spew.Dump(v.Interface())
+
+			// 填充slice
 			if isPtr {
 				direct.Set(reflect.Append(direct, vp))
 			} else {
@@ -1021,10 +1039,12 @@ func fieldsByTraversal(v reflect.Value, traversals [][]int, values []interface{}
 	}
 
 	for i, traversal := range traversals {
+		// 结构体中没有与rows.Columns字段对应上的字段，这么处理
 		if len(traversal) == 0 {
 			values[i] = new(interface{})
 			continue
 		}
+
 		f := reflectx.FieldByIndexes(v, traversal)
 		if ptrs {
 			values[i] = f.Addr().Interface()

@@ -15,14 +15,14 @@ import (
 
 // A FieldInfo is metadata for a struct field.
 type FieldInfo struct {
-	Index    []int
-	Path     string
+	Index    []int  // 之所以index是一个数组，是因为有层级关系
+	Path     string // path中含层级关系，比如person.first_name
 	Field    reflect.StructField
 	Zero     reflect.Value
-	Name     string
-	Options  map[string]string
+	Name     string            // first_name
+	Options  map[string]string // json:"xxx,omitempty" 处理其中的omitempty
 	Embedded bool
-	Children []*FieldInfo
+	Children []*FieldInfo // 维护树形关系
 	Parent   *FieldInfo
 }
 
@@ -30,8 +30,8 @@ type FieldInfo struct {
 type StructMap struct {
 	Tree  *FieldInfo
 	Index []*FieldInfo
-	Paths map[string]*FieldInfo
-	Names map[string]*FieldInfo
+	Paths map[string]*FieldInfo // 看起来用的不多
+	Names map[string]*FieldInfo // 比起paths更常用
 }
 
 // GetByPath returns a *FieldInfo for a given string path.
@@ -61,8 +61,8 @@ func (f StructMap) GetByTraversal(index []int) *FieldInfo {
 // behaves like most marshallers in the standard library, obeying a field tag
 // for name mapping but also providing a basic transform function.
 type Mapper struct {
-	cache      map[reflect.Type]*StructMap
-	tagName    string
+	cache      map[reflect.Type]*StructMap // 缓存所有类型的structMap
+	tagName    string                      // struct的tag名称
 	tagMapFunc func(string) string
 	mapFunc    func(string) string
 	mutex      sync.Mutex
@@ -185,7 +185,9 @@ func (m *Mapper) TraversalsByName(t reflect.Type, names []string) [][]int {
 func (m *Mapper) TraversalsByNameFunc(t reflect.Type, names []string, fn func(int, []int) error) error {
 	t = Deref(t)
 	mustBe(t, reflect.Struct)
+	// typeMap structMap，Mapper中有该类型的typeMap的缓存，一次进程启动，一个mapper是合理的
 	tm := m.TypeMap(t)
+	// 检索符合数据库返回column的fieldInfo.Index
 	for i, name := range names {
 		fi, ok := tm.Names[name]
 		if !ok {
@@ -204,6 +206,7 @@ func (m *Mapper) TraversalsByNameFunc(t reflect.Type, names []string, fn func(in
 // FieldByIndexes returns a value for the field given by the struct traversal
 // for the given value.
 func FieldByIndexes(v reflect.Value, indexes []int) reflect.Value {
+	// 一层一层取field，根据indexes
 	for _, i := range indexes {
 		v = reflect.Indirect(v).Field(i)
 		// if this is a pointer and it's nil, allocate a new value and set it
@@ -341,18 +344,25 @@ func parseOptions(tag string) map[string]string {
 // getMapping returns a mapping for the t type, using the tagName, mapFunc and
 // tagMapFunc to determine the canonical names of fields.
 func getMapping(t reflect.Type, tagName string, mapFunc, tagMapFunc mapf) *StructMap {
+	// 从reflect.Type中反射出Field信息
+	// 因为可能的struct是一个树形组织，需要使用DFS/BFS等算法遍历，会用到队列来解决递归问题的
+	// 对应StructMap.Index数组
 	m := []*FieldInfo{}
 
 	root := &FieldInfo{}
+	// 使用slice模拟queue
 	queue := []typeQueue{}
+	// type本身也算是一个fieldInfo，只是空的，是这么设定的
 	queue = append(queue, typeQueue{Deref(t), root, ""})
 
 QueueLoop:
 	for len(queue) != 0 {
+		// 取出queue头
 		// pop the first item off of the queue
 		tq := queue[0]
 		queue = queue[1:]
 
+		// 递归字段，类型里使用了自己这个类型，数据库model一般不会这么设计的
 		// ignore recursive field
 		for p := tq.fi.Parent; p != nil; p = p.Parent {
 			if tq.fi.Field.Type == p.Field.Type {
@@ -360,6 +370,7 @@ QueueLoop:
 			}
 		}
 
+		// children是当前类型的field数
 		nChildren := 0
 		if tq.t.Kind() == reflect.Struct {
 			nChildren = tq.t.NumField()
@@ -369,8 +380,11 @@ QueueLoop:
 		// iterate through all of its fields
 		for fieldPos := 0; fieldPos < nChildren; fieldPos++ {
 
+			// type.Field 类型
 			f := tq.t.Field(fieldPos)
 
+			// tag应该指的是`json:"xxx"`, name是xxx，是其中的内容
+			// tagName一般是db
 			// parse the tag and the target name using the mapping options for this field
 			tag, name := parseName(f, tagName, mapFunc, tagMapFunc)
 
@@ -380,12 +394,14 @@ QueueLoop:
 			}
 
 			fi := FieldInfo{
-				Field:   f,
-				Name:    name,
-				Zero:    reflect.New(f.Type).Elem(),
+				Field: f,
+				Name:  name,
+				Zero:  reflect.New(f.Type).Elem(),
+				// 类比，json:"xxx,omitempty" 处理的是emitempty
 				Options: parseOptions(tag),
 			}
 
+			// 有层级关系，使用path来存储
 			// if the path is empty this path is just the name
 			if tq.pp == "" {
 				fi.Path = fi.Name
@@ -415,21 +431,30 @@ QueueLoop:
 				fi.Children = make([]*FieldInfo, nChildren)
 				queue = append(queue, typeQueue{Deref(f.Type), &fi, pp})
 			} else if fi.Zero.Kind() == reflect.Struct || (fi.Zero.Kind() == reflect.Ptr && fi.Zero.Type().Elem().Kind() == reflect.Struct) {
+				// fieldInfo的Index，也是包含了层级关系，先是parent的fieldInfo.Index，然后补上自己的fieldPos
 				fi.Index = apnd(tq.fi.Index, fieldPos)
+				// TODO: 这里make了，但是具体内容没有填充啊？感觉是重复了。
 				fi.Children = make([]*FieldInfo, Deref(f.Type).NumField())
+				// bfs 广度优先，优先儿子，孙子靠后，通过queue来控制
 				queue = append(queue, typeQueue{Deref(f.Type), &fi, fi.Path})
 			}
 
+			// 这里跟上面else if 重复了，覆盖
 			fi.Index = apnd(tq.fi.Index, fieldPos)
+			// 指定parent
 			fi.Parent = tq.fi
+			// 指定parent的children
 			tq.fi.Children[fieldPos] = &fi
 			m = append(m, &fi)
 		}
 	}
 
+	// 把层级的field，拍扁平了
 	flds := &StructMap{Index: m, Tree: root, Paths: map[string]*FieldInfo{}, Names: map[string]*FieldInfo{}}
 	for _, fi := range flds.Index {
+		// 根据path查找的map
 		flds.Paths[fi.Path] = fi
+		// Name是""的情况是什么，embedded是匿名的struct
 		if fi.Name != "" && !fi.Embedded {
 			flds.Names[fi.Path] = fi
 		}
